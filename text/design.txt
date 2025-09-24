@@ -1,0 +1,47 @@
+Part A: Describe your design for the viewservice by answering the
+following questions:
+
+1: What goroutines are spawned in your viewservice? How do they
+interact? How do you ensure they finish once the termination channel
+is closed? What are the major components of your architecture, and how
+do they fit together?
+
+2: How do you track idle servers? What data structure is used for
+storage, and what do you need to remember in this data structure?
+
+3: Were there any design decisions around behavior? How did you
+resolve those decisions?
+
+4: Are there any parts of your solution you believe are relatively
+elegant or inelegant? If given the time to re-write your viewservice,
+what would you do differently?
+
+
+
+Part B: Describe your design for the pbservice by answering the
+following questions:
+
+1: What goroutines are spawned in your pbservice? How do they
+interact? How do you ensure they finish once the termination channel
+is closed? What are the major components of your architecture, and how
+do they fit together?
+
+2: Recall that linerizability requires that each operation appears to
+have happened at some point between the start of the operation (when
+ck.Get(), ck.Put(), or ck.Append() is called), and the end of that
+operation (when said function returns). Each individual "operation"
+may include more than one RPC call to PBServer.Operation.
+
+2a: What is the point at which the Get() operation "happens".
+2b: What is the point at which the Put() operation "happens".
+2c: What is the point at which the Append() operation "happens".
+
+3: How does your design handle the case where the Primary cannot
+confirm it is still the Primary, because the RPC to the Backup fails?
+
+4: are there any parts of your solution you believe are relatively
+elegant or inelegant? If given the time to re-write your pbservice,
+what would you do differently?
+
+
+

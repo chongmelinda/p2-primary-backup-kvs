@@ -1,0 +1,17 @@
+If you acheived a correctness score of 80 or higher by the deadline,
+you will be given three different potential solutions to Project
+1. For each potential solution, answer the following questions:
+
+1: Do you believe this solution correctly terminates all spawned
+goroutines before ManagerImpl returns? Why or why not?
+
+2: Does this solution have any design decisions, architecture
+features, or code organization techniques that you found particularly
+compelling? If so, what were they?
+
+3: Do you have any comments for the author of this code? In answering
+this question, please be sure your comments are: true, necessary,
+kind, and helpful. In other words, be *professional* and *courteous*
+in making these comments.
+
+
