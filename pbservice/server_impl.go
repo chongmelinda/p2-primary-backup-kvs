@@ -6,19 +6,19 @@ import (
     "strings"
 )
 
-type opRequest struct {
+type opReq struct {
 	args  OpArgs
 	reply *OpReply
 	done  chan bool
 }
 
-type pushRequest struct {
+type pushReq struct {
 	args  PushArgs
 	reply *PushReply
 	done  chan bool
 }
 
-type tickRequest struct {
+type tickReq struct {
 	done chan bool
 }
 
@@ -26,188 +26,201 @@ type PBServerImpl struct {
     kv           map[string]string
     results      map[string]map[int]OpReply
     view         viewservice.View
-    lastPingTime time.Time
+    lastpingtime time.Time
     
     // Channels for serialization
-    opChan    chan *opRequest
-    pushChan  chan *pushRequest
-    tickChan  chan *tickRequest
+    op_chan    chan *opReq
+    push_chan  chan *pushReq
+    tick_chan  chan *tickReq
 }
 
 func (pb *PBServer) initImpl() {
 	pb.impl.kv = make(map[string]string)
 	pb.impl.results = make(map[string]map[int]OpReply)
-    pb.impl.lastPingTime = time.Now()
+    pb.impl.lastpingtime = time.Now()
+    //this is to make sure we're not overpinging
+
+    // initialize chans
+    pb.impl.op_chan = make(chan *opReq)
+    pb.impl.push_chan = make(chan *pushReq)
+    pb.impl.tick_chan = make(chan *tickReq)
     
-    // Initialize channels
-    pb.impl.opChan = make(chan *opRequest)
-    pb.impl.pushChan = make(chan *pushRequest)
-    pb.impl.tickChan = make(chan *tickRequest)
-    
-    // Start the serializer goroutine
-    go pb.serializer()
+    // start run_channels goroutine
+    go pb.run_channels()
 }
 
-// Single goroutine that processes all state modifications
-func (pb *PBServer) serializer() {
+// processes all state modifications
+func (pb *PBServer) run_channels() {
 	for {
 		select {
-		case req := <-pb.impl.opChan:
+		case req := <-pb.impl.op_chan:
 			pb.operationImpl(&req.args, req.reply)
 			req.done <- true
 			
-		case req := <-pb.impl.pushChan:
+		case req := <-pb.impl.push_chan:
 			pb.pushImpl(&req.args, req.reply)
 			req.done <- true
 			
-		case req := <-pb.impl.tickChan:
+		case req := <-pb.impl.tick_chan:
 			pb.tickImpl()
 			req.done <- true
 		}
 	}
 }
 
-// Operation() now just sends request through channel
+// Operation() sends the req through the channel instead of doing ti all by itself
 func (pb *PBServer) Operation(args OpArgs, reply *OpReply) error {
-	req := &opRequest{
+	req := &opReq{
 		args:  args,
 		reply: reply,
 		done:  make(chan bool),
 	}
-	pb.impl.opChan <- req
+	pb.impl.op_chan <- req
 	<-req.done
 	return nil
 }
 
-// The actual operation logic (runs in serializer goroutine)
+// what operation() does (runs in run_channels goroutine)
 func (pb *PBServer) operationImpl(args *OpArgs, reply *OpReply) {
     if pb.isdead() {
         reply.Err = ErrWrongServer
         return
     }
+    //if dead dont do anything
     
-    timeSinceLastPing := time.Since(pb.impl.lastPingTime)
-    if timeSinceLastPing > viewservice.PingInterval * viewservice.DeadPings {
+    time_since_last_ping := time.Since(pb.impl.lastpingtime)
+    if time_since_last_ping > viewservice.PingInterval * viewservice.DeadPings {
         reply.Err = ErrWrongServer
         return
     }
+    //if too long, it's dead
 
-    isFromPrimary := (args.Source == pb.impl.view.Primary)
+    from_primary := (args.Source == pb.impl.view.Primary) //if the request was from primary
     if args.Source == "" {
         if pb.me != pb.impl.view.Primary {
             reply.Err = ErrWrongServer
             return
-        }
+        } // if no source id and it is not primary, error
     } else {
-        if !(pb.me == pb.impl.view.Backup && isFromPrimary) && !(pb.me == pb.impl.view.Primary && args.Source == pb.impl.view.Primary) {
+        if !(pb.me == pb.impl.view.Backup && from_primary) && !(pb.me == pb.impl.view.Primary && args.Source == pb.impl.view.Primary) {
             if pb.me != pb.impl.view.Primary {
                 reply.Err = ErrWrongServer
                 return
             }
-        }
-    }
-    if _, ok := pb.impl.results[args.Client]; !ok {
-        pb.impl.results[args.Client] = make(map[int]OpReply)
+        }// if not backup && source is from primary && not primary && source is from primary, err
     }
 
-    // Check for exact sequence number match
-    if cached, ok := pb.impl.results[args.Client][args.SeqNo]; ok {
+    _, ok := pb.impl.results[args.Client]
+    if !ok {
+        pb.impl.results[args.Client] = make(map[int]OpReply)
+    }
+    //now put it all into results
+
+    
+    cached, ok := pb.impl.results[args.Client][args.SeqNo]
+    if ok {
         *reply = cached
         return
     }
-    
-    // No cached result - this is a new operation, execute it
+    // check for the seq number match
+
+    // no cache, then new operation
     
     var result OpReply
 
     switch args.Op {
     case GET:
-        if val, ok := pb.impl.kv[args.Key]; ok {
+        val, ok := pb.impl.kv[args.Key]
+        if ok {
             result = OpReply{Err: OK, Value: val}
         } else {
             result = OpReply{Err: ErrNoKey, Value: ""}
         }
         *reply = result
-        return  // <-- ADDED: Return early, don't cache GETs
-case PUT:
-    // If we're backup and this was forwarded from primary, apply locally & cache
-    if pb.me == pb.impl.view.Backup && isFromPrimary {
-        if _, ok := pb.impl.results[args.Client]; !ok {
-            pb.impl.results[args.Client] = make(map[int]OpReply)
-        }
-        if cached, ok := pb.impl.results[args.Client][args.SeqNo]; ok {
-            *reply = cached
-            return
-        }
+        return  //DO NOT CACHE GETS OH MY GOD
 
-        pb.impl.kv[args.Key] = args.Value
-        result = OpReply{Err: OK}
-        pb.impl.results[args.Client][args.SeqNo] = result
-    } else {
-        // Primary handling:
-        // If there is a backup, forward first; only apply locally after backup ACKs.
-        if pb.impl.view.Backup != "" && pb.impl.view.Backup != pb.me {
-            fwd := *args
-            fwd.Source = pb.me
-            var fwdReply OpReply
-            ok := call(pb.impl.view.Backup, "PBServer.Operation", &fwd, &fwdReply)
-            if !ok || fwdReply.Err != OK {
-                // forward failed (or backup rejected) -> tell client to retry / view change
-                reply.Err = ErrWrongServer
-                return
+    case PUT:
+        // if we're backup and forwarded from primary, apply locally and then cache
+        if pb.me == pb.impl.view.Backup && from_primary {
+            _, ok := pb.impl.results[args.Client]
+            if !ok {
+                pb.impl.results[args.Client] = make(map[int]OpReply)
             }
-            // backup applied successfully, now apply locally
+            cached, ok := pb.impl.results[args.Client][args.SeqNo]
+            if ok {
+                *reply = cached
+                return
+            }//FOR AVOIDING DOUBLE APPENDS, if cached, return the cached
+
             pb.impl.kv[args.Key] = args.Value
             result = OpReply{Err: OK}
-            // cache only now
             pb.impl.results[args.Client][args.SeqNo] = result
         } else {
-            // no backup: apply locally & cache
-            pb.impl.kv[args.Key] = args.Value
-            result = OpReply{Err: OK}
-            pb.impl.results[args.Client][args.SeqNo] = result
-        }
-    }
-
-case APPEND:
-    if pb.me == pb.impl.view.Backup && isFromPrimary {
-        if _, ok := pb.impl.results[args.Client]; !ok {
-            pb.impl.results[args.Client] = make(map[int]OpReply)
-        }
-        if cached, ok := pb.impl.results[args.Client][args.SeqNo]; ok {
-            *reply = cached
-            return
-        }
-        pb.impl.kv[args.Key] += args.Value
-        result = OpReply{Err: OK}
-        pb.impl.results[args.Client][args.SeqNo] = result
-    } else {
-        if pb.impl.view.Backup != "" && pb.impl.view.Backup != pb.me {
-            fwd := *args
-            fwd.Source = pb.me
-            var fwdReply OpReply
-            ok := call(pb.impl.view.Backup, "PBServer.Operation", &fwd, &fwdReply)
-            if !ok || fwdReply.Err != OK {
-                reply.Err = ErrWrongServer
-                return
+            // primary: if there is a backup we need to forward first and only apply locally after backup ack done
+            if pb.impl.view.Backup != "" && pb.impl.view.Backup != pb.me {
+                fwd := *args
+                fwd.Source = pb.me
+                var fwdReply OpReply
+                ok := call(pb.impl.view.Backup, "PBServer.Operation", &fwd, &fwdReply) //if still alive
+                if !ok || fwdReply.Err != OK {
+                    // forward must have failed so tell the client to retry or view change
+                    reply.Err = ErrWrongServer
+                    return
+                }
+                // backup applied successfully, now apply locally
+                pb.impl.kv[args.Key] = args.Value
+                result = OpReply{Err: OK}
+                // cache only now
+                pb.impl.results[args.Client][args.SeqNo] = result
+            } else {
+                // no backup: apply locally & cache
+                pb.impl.kv[args.Key] = args.Value
+                result = OpReply{Err: OK}
+                pb.impl.results[args.Client][args.SeqNo] = result
             }
-            // backup acked, now apply locally
+        }
+
+    case APPEND:
+        if pb.me == pb.impl.view.Backup && from_primary { //if from primary and we're backup
+            _, ok := pb.impl.results[args.Client]
+            if !ok {
+                pb.impl.results[args.Client] = make(map[int]OpReply)
+            }//create cache
+            cached, ok := pb.impl.results[args.Client][args.SeqNo]
+            if ok {
+                *reply = cached
+                return
+            } //FOR AVOIDING DOUBLE APPENDS, we return the cached result if true
             pb.impl.kv[args.Key] += args.Value
             result = OpReply{Err: OK}
             pb.impl.results[args.Client][args.SeqNo] = result
         } else {
-            // no backup
-            pb.impl.kv[args.Key] += args.Value
-            result = OpReply{Err: OK}
-            pb.impl.results[args.Client][args.SeqNo] = result
+            if pb.impl.view.Backup != "" && pb.impl.view.Backup != pb.me {
+                fwd := *args
+                fwd.Source = pb.me
+                var fwdReply OpReply
+                ok := call(pb.impl.view.Backup, "PBServer.Operation", &fwd, &fwdReply) //if still alive
+                if !ok || fwdReply.Err != OK {
+                    reply.Err = ErrWrongServer
+                    return
+                }
+                // backup acked, now apply locally
+                pb.impl.kv[args.Key] += args.Value
+                result = OpReply{Err: OK}
+                pb.impl.results[args.Client][args.SeqNo] = result
+            } else {
+                // no backup
+                pb.impl.kv[args.Key] += args.Value
+                result = OpReply{Err: OK}
+                pb.impl.results[args.Client][args.SeqNo] = result
+            }
         }
-    }
 
     default:
         result = OpReply{Err: ErrWrongServer}
     }
 
-// Only cache results when handling direct client requests
+// only cache the results when doing the direct client requests
     if args.Source == "" {
         pb.impl.results[args.Client][args.SeqNo] = result
     }
@@ -216,19 +229,19 @@ case APPEND:
 }
 
 
-// Push() sends request through channel
+// push() sends request through channel
 func (pb *PBServer) Push(args PushArgs, reply *PushReply) error {
-	req := &pushRequest{
+	req := &pushReq{
 		args:  args,
 		reply: reply,
 		done:  make(chan bool),
 	}
-	pb.impl.pushChan <- req
+	pb.impl.push_chan <- req
 	<-req.done
 	return nil
 }
 
-// The actual push logic (runs in serializer goroutine)
+// actual push() logic (runs in goroutine)
 func (pb *PBServer) pushImpl(args *PushArgs, reply *PushReply) {
     if pb.me != pb.impl.view.Backup {
         reply.Err = ErrWrongServer
@@ -244,18 +257,20 @@ func (pb *PBServer) pushImpl(args *PushArgs, reply *PushReply) {
     for k, v := range args.KVStore {
         pb.impl.kv[k] = v
     }
+    //push it
 
     pb.impl.results = make(map[string]map[int]OpReply)
 	for key, result := range args.OpCache {
-		// Parse the key to extract client ID (format: "clientID-seqno")
+		// string parsing the key to get client ID, in the form clientID-seqno
 		parts := strings.Split(key, "-")
 		if len(parts) < 2 {
 			continue
 		}
-		// The client ID might contain dashes, so rejoin all but the last part
+		//client ID might have dashes, rejoin all but the last part
+
 		client := strings.Join(parts[:len(parts)-1], "-")
-		
-		if _, ok := pb.impl.results[client]; !ok {
+		_, ok := pb.impl.results[client]
+		if !ok {
 			pb.impl.results[client] = make(map[int]OpReply)
 		}
         pb.impl.results[client][result.SeqNo] = result.V
@@ -267,46 +282,47 @@ func (pb *PBServer) pushImpl(args *PushArgs, reply *PushReply) {
 
 // tick() sends request through channel
 func (pb *PBServer) tick() {
-	req := &tickRequest{
+	req := &tickReq{
 		done: make(chan bool),
 	}
-	pb.impl.tickChan <- req
+	pb.impl.tick_chan <- req
 	<-req.done
 }
 
-// The actual tick logic (runs in serializer goroutine)
+// tick logic (runs in run_channels goroutine)
 func (pb *PBServer) tickImpl() {
 	if pb.isdead() {
 		return
 	}
+    //if its dead just return
 
-	newView, err := pb.vs.Ping(pb.impl.view.Viewnum)
+	new_view, err := pb.vs.Ping(pb.impl.view.Viewnum)
 
     if err != nil {
         return
     }
-    
-    pb.impl.lastPingTime = time.Now()
+    //if error, return
+    pb.impl.lastpingtime = time.Now()
 
-    var oldView viewservice.View
-    if newView.Viewnum != pb.impl.view.Viewnum {
-        oldView = pb.impl.view
-        pb.impl.view = newView
+    var old_view viewservice.View
+    if new_view.Viewnum != pb.impl.view.Viewnum {
+        old_view = pb.impl.view
+        pb.impl.view = new_view
     }
 
     if pb.me == pb.impl.view.Primary {
-        if pb.impl.view.Backup != "" && pb.impl.view.Backup != oldView.Backup {
-			// Copy KV store
+        if pb.impl.view.Backup != "" && pb.impl.view.Backup != old_view.Backup {
+			// make a copy of kv
 			kvCopy := make(map[string]string)
 			for k, v := range pb.impl.kv {
 				kvCopy[k] = v
 			}
 			
-			// Copy ALL cached results (not just highest)
+			// copy EVERY cached result
 			opCache := make(map[string]Result)
 			for client, clientResults := range pb.impl.results {
 				for seq, result := range clientResults {
-					// Create unique key for each client+seq combination
+					// make unique key for each client+seq combination
 					key := client + "-" + strconv.Itoa(seq)
 					opCache[key] = Result{SeqNo: seq, V: result}
 				}
@@ -317,8 +333,9 @@ func (pb *PBServer) tickImpl() {
 				OpCache: opCache,
 				View:    pb.impl.view,
 			}
+            
 			var reply PushReply
-			call(pb.impl.view.Backup, "PBServer.Push", &args, &reply)
+			call(pb.impl.view.Backup, "PBServer.Push", &args, &reply) //if still alive
         }
     }
 }
