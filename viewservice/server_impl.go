@@ -5,58 +5,63 @@ type pingReq struct {
 	reply *PingReply
 	done  chan bool
 }
+// for the ping channel
 
 type getReq struct {
 	args  *GetArgs
 	reply *GetReply
 	done  chan bool
 }
+// get channel
 
 type tickReq struct {
 	done chan bool
 }
+// tick channel
 
 type ViewServerImpl struct {
-	currentView View
-	lastPing    map[string]int
-	serverView  map[string]uint
-	tickCount   int
+	cur_view View //current view
+	last_ping    map[string]int
+	server_view  map[string]uint
+	tick_count   int
 	
 	// Channels for serialization
-	pingChan chan *pingReq
-	getChan  chan *getReq
-	tickChan chan *tickReq
+	ping_chan chan *pingReq
+	get_chan  chan *getReq
+	tick_chan chan *tickReq
 }
 
 func (vs *ViewServer) initImpl() {
 	vs.impl = ViewServerImpl{
-		currentView: View{Viewnum: 0, Primary: "", Backup: ""},
-		lastPing:    make(map[string]int),
-		serverView:  make(map[string]uint),
-		tickCount:   0,
-		pingChan:    make(chan *pingReq),
-		getChan:     make(chan *getReq),
-		tickChan:    make(chan *tickReq),
+		cur_view: View{Viewnum: 0, Primary: "", Backup: ""},
+		last_ping:    make(map[string]int),
+		server_view:  make(map[string]uint),
+		tick_count:   0,
+		ping_chan:    make(chan *pingReq),
+		get_chan:     make(chan *getReq),
+		tick_chan:    make(chan *tickReq),
 	}
 	
-	// Start serializer
-	go vs.serializer()
+	// Start run_channels
+	go vs.run_channels()
 }
 
-func (vs *ViewServer) serializer() {
+func (vs *ViewServer) run_channels() {
+	//everything is run up here
 	for {
 		select {
-		case req := <-vs.impl.pingChan:
-			vs.pingImplInternal(req.args, req.reply)
+		case req := <-vs.impl.ping_chan:
+			vs.ping_impl_internal(req.args, req.reply)
 			req.done <- true
-			
-		case req := <-vs.impl.getChan:
-			vs.getImplInternal(req.args, req.reply)
+			// finish up ping_chan
+		case req := <-vs.impl.get_chan:
+			vs.get_impl_internal(req.reply)
 			req.done <- true
-			
-		case req := <-vs.impl.tickChan:
-			vs.tickInternal()
+			//finish up get_chan
+		case req := <-vs.impl.tick_chan:
+			vs.tick_internal()
 			req.done <- true
+			//finish up tick_chan
 		}
 	}
 }
@@ -67,30 +72,32 @@ func (vs *ViewServer) PingImpl(args *PingArgs, reply *PingReply) error {
 		reply: reply,
 		done:  make(chan bool),
 	}
-	vs.impl.pingChan <- req
+	vs.impl.ping_chan <- req
 	<-req.done
 	return nil
+	//for the channel
 }
 
-func (vs *ViewServer) pingImplInternal(args *PingArgs, reply *PingReply) {
+func (vs *ViewServer) ping_impl_internal(args *PingArgs, reply *PingReply) {
 	vs.me = args.Me
-	vs.impl.lastPing[args.Me] = vs.impl.tickCount
-
-	if vs.impl.currentView.Primary == "" {
-		vs.impl.currentView.Primary = args.Me
-		vs.impl.currentView.Viewnum++
+	vs.impl.last_ping[args.Me] = vs.impl.tick_count
+	//update tick_count
+	if vs.impl.cur_view.Primary == "" {
+		vs.impl.cur_view.Primary = args.Me
+		vs.impl.cur_view.Viewnum++
 	}
-	
-	if vs.impl.currentView.Primary != "" && vs.impl.currentView.Backup == "" && vs.impl.currentView.Primary != args.Me {
-		primaryAcked := (vs.impl.serverView[vs.impl.currentView.Primary] == vs.impl.currentView.Viewnum)
-		if primaryAcked {
-			vs.impl.currentView.Backup = args.Me
-			vs.impl.currentView.Viewnum++
+	//change view
+	if vs.impl.cur_view.Primary != "" && vs.impl.cur_view.Backup == "" && vs.impl.cur_view.Primary != args.Me {
+		primary_ack := (vs.impl.server_view[vs.impl.cur_view.Primary] == vs.impl.cur_view.Viewnum)
+		if primary_ack {
+			vs.impl.cur_view.Backup = args.Me
+			vs.impl.cur_view.Viewnum++
 		}
 	}
-
-	vs.impl.serverView[args.Me] = args.Viewnum
-	reply.View = vs.impl.currentView
+	//check for idle server and ack, then assign backup
+	vs.impl.server_view[args.Me] = args.Viewnum
+	reply.View = vs.impl.cur_view
+	//update views
 }
 
 func (vs *ViewServer) GetImpl(args *GetArgs, reply *GetReply) error {
@@ -99,95 +106,102 @@ func (vs *ViewServer) GetImpl(args *GetArgs, reply *GetReply) error {
 		reply: reply,
 		done:  make(chan bool),
 	}
-	vs.impl.getChan <- req
+	vs.impl.get_chan <- req
 	<-req.done
 	return nil
+	//for the get_channel
 }
 
-func (vs *ViewServer) getImplInternal(args *GetArgs, reply *GetReply) {
-	reply.View = vs.impl.currentView
+func (vs *ViewServer) get_impl_internal(reply *GetReply) {
+	reply.View = vs.impl.cur_view
+	//get current view
 }
 
 func (vs *ViewServer) tick() {
 	req := &tickReq{
 		done: make(chan bool),
 	}
-	vs.impl.tickChan <- req
+	vs.impl.tick_chan <- req
 	<-req.done
+	//for the tick channel
 }
 
-func (vs *ViewServer) tickInternal() {
-	vs.impl.tickCount++
+func (vs *ViewServer) tick_internal() {
+	vs.impl.tick_count++
 
 	changed_view := false
-	for server, lastTick := range vs.impl.lastPing {
-		if vs.impl.tickCount-lastTick > DeadPings {
-			if vs.impl.serverView[vs.impl.currentView.Primary] == 0 {
-				vs.impl.currentView.Primary = ""
-				vs.impl.currentView.Backup = ""
+	for server, lastTick := range vs.impl.last_ping {
+		if vs.impl.tick_count-lastTick > DeadPings {
+			if vs.impl.server_view[vs.impl.cur_view.Primary] == 0 {
+				vs.impl.cur_view.Primary = ""
+				vs.impl.cur_view.Backup = ""
 				changed_view = true
 			}
-
-			if vs.impl.currentView.Primary != "" && (vs.impl.tickCount-vs.impl.lastPing[vs.impl.currentView.Primary] > DeadPings) {
-				primaryAcked := vs.impl.serverView[vs.impl.currentView.Primary] == vs.impl.currentView.Viewnum
-				if primaryAcked && vs.impl.currentView.Backup != "" {
-					vs.impl.currentView.Primary = vs.impl.currentView.Backup
-					vs.impl.currentView.Backup = ""
+			//if view restarted, reset primary and backup
+			if vs.impl.cur_view.Primary != "" && (vs.impl.tick_count-vs.impl.last_ping[vs.impl.cur_view.Primary] > DeadPings) {
+				primary_ack := vs.impl.server_view[vs.impl.cur_view.Primary] == vs.impl.cur_view.Viewnum
+				if primary_ack && vs.impl.cur_view.Backup != "" {
+					vs.impl.cur_view.Primary = vs.impl.cur_view.Backup
+					vs.impl.cur_view.Backup = ""
 					changed_view = true
 				}
 			}
-
-			if vs.impl.currentView.Backup == server {
-				vs.impl.currentView.Backup = ""
+			//check for nonblank primary and if it's dead, then make backup new primary
+			if vs.impl.cur_view.Backup == server {
+				vs.impl.cur_view.Backup = ""
 				changed_view = true
 			}
-
-			if vs.impl.serverView[server] == 0 {
-				if vs.impl.currentView.Primary == server {
-					vs.impl.currentView.Primary = ""
+			//if backup dead, clear it
+			if vs.impl.server_view[server] == 0 {
+				if vs.impl.cur_view.Primary == server {
+					vs.impl.cur_view.Primary = ""
 					changed_view = true
 				}
-				if vs.impl.currentView.Backup == server {
-					vs.impl.currentView.Backup = ""
+				if vs.impl.cur_view.Backup == server {
+					vs.impl.cur_view.Backup = ""
 					changed_view = true
 				}
 				continue
 			}
+			//if view 0, means reset, so either clear primary or backup
 		}
 	}
 
-	if vs.impl.currentView.Primary == "" {
-		for server := range vs.impl.lastPing {
-			if vs.impl.tickCount-vs.impl.lastPing[server] > DeadPings {
+	if vs.impl.cur_view.Primary == "" {
+		for server := range vs.impl.last_ping {
+			if vs.impl.tick_count-vs.impl.last_ping[server] > DeadPings {
 				continue
 			}
-			if vs.impl.serverView[server] == 0 {
+			if vs.impl.server_view[server] == 0 {
 				continue
 			}
-			vs.impl.currentView.Primary = server
+			vs.impl.cur_view.Primary = server
 			changed_view = true
 			break
 		}
+		//only update primary with valid servers
 	}
 
-	if vs.impl.currentView.Backup == "" && vs.impl.currentView.Primary != "" {
-		primaryAcked := (vs.impl.serverView[vs.impl.currentView.Primary] == vs.impl.currentView.Viewnum)
-		if primaryAcked {
-			for server := range vs.impl.lastPing {
-				if vs.impl.tickCount-vs.impl.lastPing[server] > DeadPings {
+	if vs.impl.cur_view.Backup == "" && vs.impl.cur_view.Primary != "" {
+		primary_ack := (vs.impl.server_view[vs.impl.cur_view.Primary] == vs.impl.cur_view.Viewnum)
+		if primary_ack {
+			for server := range vs.impl.last_ping {
+				if vs.impl.tick_count-vs.impl.last_ping[server] > DeadPings {
 					continue
 				}
-				if server == vs.impl.currentView.Primary {
+				if server == vs.impl.cur_view.Primary {
 					continue
 				}
-				vs.impl.currentView.Backup = server
+				vs.impl.cur_view.Backup = server
 				changed_view = true
 				break
 			}
 		}
+		//update backup with valid servers and not currently primary
 	}
 
 	if changed_view {
-		vs.impl.currentView.Viewnum++
+		vs.impl.cur_view.Viewnum++
 	}
+	//update viewnum
 }
